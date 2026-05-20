@@ -8,8 +8,8 @@ mod trim;
 pub use chunk_size::{
     Characters, ChunkCapacity, ChunkCapacityError, ChunkConfig, ChunkConfigError, ChunkSizer,
 };
-#[cfg(feature = "markdown")]
-pub use splitter::MarkdownSplitter;
 pub use splitter::{ChunkCharIndex, TextSplitter};
+#[cfg(feature = "markdown")]
+pub use splitter::{ChunkCharIndexWithContext, HeadingContext, HeadingLevel, MarkdownSplitter};
 #[cfg(feature = "code")]
 pub use splitter::{CodeSplitter, CodeSplitterError};
