@@ -8,7 +8,7 @@ use std::{iter::once, ops::Range};
 
 use either::Either;
 use itertools::Itertools;
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use crate::{
     splitter::{SemanticLevel, Splitter},
@@ -16,7 +16,7 @@ use crate::{
     ChunkConfig, ChunkSizer,
 };
 
-use super::ChunkCharIndex;
+use super::{ChunkCharIndex, TextChunks, TextChunksWithCharIndices};
 
 /// Markdown splitter. Recursively splits chunks into the largest
 /// semantic units that fit within the chunk size. Also will
@@ -133,6 +133,91 @@ where
     ) -> impl Iterator<Item = ChunkCharIndex<'text>> + 'splitter {
         Splitter::<_>::chunk_char_indices(self, text)
     }
+
+    /// Returns an iterator over chunks along with the most recent heading at
+    /// each level that precedes (or starts at) each chunk's byte offset.
+    ///
+    /// The [`HeadingContext`] tracks the current heading hierarchy: when a new
+    /// heading is encountered at level `L`, it replaces the previous entry at
+    /// `L` and clears all entries at deeper levels.
+    ///
+    /// Useful for contextual chunk headers in RAG pipelines — see
+    /// <https://github.com/benbrandt/text-splitter/issues/116>.
+    ///
+    /// ```
+    /// use text_splitter::{HeadingLevel, MarkdownSplitter};
+    ///
+    /// // Small capacity forces text-splitter to emit a chunk for each section.
+    /// let splitter = MarkdownSplitter::new(15);
+    /// let text = "# A\n\nintro\n\n## B\n\nbody\n";
+    /// let chunks: Vec<_> = splitter.chunks_with_context(text).collect();
+    /// // The last chunk sits past both headings, so its context exposes both.
+    /// let (_chunk, ctx) = chunks.last().unwrap();
+    /// assert_eq!(ctx.at(HeadingLevel::H1), Some("A"));
+    /// assert_eq!(ctx.at(HeadingLevel::H2), Some("B"));
+    /// ```
+    pub fn chunks_with_context<'splitter, 'text: 'splitter>(
+        &'splitter self,
+        text: &'text str,
+    ) -> impl Iterator<Item = (&'text str, HeadingContext<'text>)> + 'splitter {
+        self.chunk_indices_with_context(text)
+            .map(|(_, chunk, ctx)| (chunk, ctx))
+    }
+
+    /// Like [`chunk_indices`] but additionally yields a [`HeadingContext`]
+    /// reflecting the heading hierarchy active at the chunk's byte offset.
+    ///
+    /// See [`MarkdownSplitter::chunks_with_context`] for details.
+    pub fn chunk_indices_with_context<'splitter, 'text: 'splitter>(
+        &'splitter self,
+        text: &'text str,
+    ) -> impl Iterator<Item = (usize, &'text str, HeadingContext<'text>)> + 'splitter {
+        // One markdown parse for both element ranges (for chunking) and
+        // heading metadata (for context).
+        let (elements, headings) = parse_markdown(text);
+        let mut hi = 0;
+        let mut ctx = HeadingContext::default();
+        TextChunks::<Sizer, Element>::new(&self.chunk_config, text, elements, Self::TRIM_CONST).map(
+            move |(byte_offset, chunk)| {
+                advance_context(&mut ctx, &headings, &mut hi, byte_offset);
+                (byte_offset, chunk, ctx)
+            },
+        )
+    }
+
+    /// Like [`chunk_char_indices`] but additionally yields a
+    /// [`HeadingContext`] reflecting the heading hierarchy active at the
+    /// chunk's byte offset.
+    ///
+    /// See [`MarkdownSplitter::chunks_with_context`] for details.
+    pub fn chunk_char_indices_with_context<'splitter, 'text: 'splitter>(
+        &'splitter self,
+        text: &'text str,
+    ) -> impl Iterator<Item = ChunkCharIndexWithContext<'text>> + 'splitter {
+        let (elements, headings) = parse_markdown(text);
+        let mut hi = 0;
+        let mut ctx = HeadingContext::default();
+        TextChunksWithCharIndices::<Sizer, Element>::new(
+            &self.chunk_config,
+            text,
+            elements,
+            Self::TRIM_CONST,
+        )
+        .map(move |cc| {
+            advance_context(&mut ctx, &headings, &mut hi, cc.byte_offset);
+            ChunkCharIndexWithContext {
+                chunk: cc.chunk,
+                byte_offset: cc.byte_offset,
+                char_offset: cc.char_offset,
+                context: ctx,
+            }
+        })
+    }
+
+    /// Mirrors `<Self as Splitter<_>>::TRIM` for use in the inherent context
+    /// methods (which can't easily reference the trait constant in expression
+    /// position without UFCS gymnastics).
+    const TRIM_CONST: Trim = Trim::PreserveIndentation;
 }
 
 impl<Sizer> Splitter<Sizer> for MarkdownSplitter<Sizer>
@@ -150,51 +235,57 @@ where
     fn parse(&self, text: &str) -> Vec<(Self::Level, Range<usize>)> {
         Parser::new_ext(text, Options::all())
             .into_offset_iter()
-            .filter_map(|(event, range)| match event {
-                Event::Start(
-                    Tag::Emphasis
-                    | Tag::Strong
-                    | Tag::Strikethrough
-                    | Tag::Link { .. }
-                    | Tag::Image { .. }
-                    | Tag::Subscript
-                    | Tag::Superscript
-                    | Tag::TableCell,
-                )
-                | Event::Text(_)
-                | Event::HardBreak
-                | Event::Code(_)
-                | Event::InlineHtml(_)
-                | Event::InlineMath(_)
-                | Event::FootnoteReference(_)
-                | Event::TaskListMarker(_) => Some((Element::Inline, range)),
-                Event::SoftBreak => Some((Element::SoftBreak, range)),
-                Event::Html(_)
-                | Event::DisplayMath(_)
-                | Event::Start(
-                    Tag::Paragraph
-                    | Tag::CodeBlock(_)
-                    | Tag::FootnoteDefinition(_)
-                    | Tag::MetadataBlock(_)
-                    | Tag::TableHead
-                    | Tag::BlockQuote(_)
-                    | Tag::TableRow
-                    | Tag::Item
-                    | Tag::HtmlBlock
-                    | Tag::List(_)
-                    | Tag::Table(_)
-                    | Tag::DefinitionList
-                    | Tag::DefinitionListTitle
-                    | Tag::DefinitionListDefinition,
-                ) => Some((Element::Block, range)),
-                Event::Rule => Some((Element::Rule, range)),
-                Event::Start(Tag::Heading { level, .. }) => {
-                    Some((Element::Heading(level.into()), range))
-                }
-                // End events are identical to start, so no need to grab them.
-                Event::End(_) => None,
-            })
+            .filter_map(|(event, range)| classify_event(&event).map(|el| (el, range)))
             .collect()
+    }
+}
+
+/// Classify a pulldown-cmark event into the corresponding [`Element`] semantic
+/// level, or `None` if the event doesn't open one. Shared by [`MarkdownSplitter`]'s
+/// [`Splitter::parse`] impl and the combined [`parse_markdown`] walker so the
+/// classification stays in one place.
+fn classify_event(event: &Event<'_>) -> Option<Element> {
+    match event {
+        Event::Start(
+            Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Link { .. }
+            | Tag::Image { .. }
+            | Tag::Subscript
+            | Tag::Superscript
+            | Tag::TableCell,
+        )
+        | Event::Text(_)
+        | Event::HardBreak
+        | Event::Code(_)
+        | Event::InlineHtml(_)
+        | Event::InlineMath(_)
+        | Event::FootnoteReference(_)
+        | Event::TaskListMarker(_) => Some(Element::Inline),
+        Event::SoftBreak => Some(Element::SoftBreak),
+        Event::Html(_)
+        | Event::DisplayMath(_)
+        | Event::Start(
+            Tag::Paragraph
+            | Tag::CodeBlock(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::MetadataBlock(_)
+            | Tag::TableHead
+            | Tag::BlockQuote(_)
+            | Tag::TableRow
+            | Tag::Item
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::Table(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition,
+        ) => Some(Element::Block),
+        Event::Rule => Some(Element::Rule),
+        Event::Start(Tag::Heading { level, .. }) => Some(Element::Heading((*level).into())),
+        // End events are identical to start, so no need to grab them.
+        Event::End(_) => None,
     }
 }
 
@@ -202,12 +293,40 @@ where
 /// Sorted in reverse order for sorting purposes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum HeadingLevel {
+    /// Level 6 heading (`######`) — the smallest break.
     H6,
+    /// Level 5 heading (`#####`).
     H5,
+    /// Level 4 heading (`####`).
     H4,
+    /// Level 3 heading (`###`).
     H3,
+    /// Level 2 heading (`##`).
     H2,
+    /// Level 1 heading (`#`) — the largest break.
     H1,
+}
+
+impl HeadingLevel {
+    /// All six heading levels in shallow-to-deep order: `[H1, H2, …, H6]`.
+    ///
+    /// Useful for iterating over a [`HeadingContext`] without depending on
+    /// the enum's declaration order (which is reversed for `Ord` purposes).
+    pub const ALL: [Self; 6] = [Self::H1, Self::H2, Self::H3, Self::H4, Self::H5, Self::H6];
+
+    /// The heading depth: `H1 → 1`, `H2 → 2`, … `H6 → 6`. Matches the number
+    /// of `#` characters in the source (and the variant name).
+    #[must_use]
+    pub const fn depth(self) -> usize {
+        match self {
+            Self::H1 => 1,
+            Self::H2 => 2,
+            Self::H3 => 3,
+            Self::H4 => 4,
+            Self::H5 => 5,
+            Self::H6 => 6,
+        }
+    }
 }
 
 impl From<pulldown_cmark::HeadingLevel> for HeadingLevel {
@@ -332,6 +451,143 @@ impl SemanticLevel for Element {
             })
             .flatten()
             .filter(|(_, s)| !s.is_empty())
+    }
+}
+
+/// The heading hierarchy active at a given point in the document.
+///
+/// Returned alongside each chunk by [`MarkdownSplitter::chunks_with_context`]
+/// and friends. Internally a fixed-size array, so cloning / iterating is
+/// allocation-free.
+///
+/// Semantics: when a heading at level `L` appears in the source, it replaces
+/// the previous entry at level `L` and clears every entry at deeper levels
+/// (consistent with how markdown headings nest).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadingContext<'text> {
+    levels: [Option<&'text str>; 6],
+}
+
+impl<'text> HeadingContext<'text> {
+    /// Heading text at the given level, if one is active.
+    #[must_use]
+    pub fn at(&self, level: HeadingLevel) -> Option<&'text str> {
+        self.levels[level.depth() - 1]
+    }
+
+    /// The deepest active heading: `(level, text)`. Returns `None` if no
+    /// heading has been seen yet (preamble content).
+    #[must_use]
+    pub fn deepest(&self) -> Option<(HeadingLevel, &'text str)> {
+        HeadingLevel::ALL
+            .iter()
+            .rev()
+            .find_map(|&l| self.levels[l.depth() - 1].map(|t| (l, t)))
+    }
+
+    /// Iterate active headings from H1 → H6 (shallow to deep).
+    pub fn iter(&self) -> impl Iterator<Item = (HeadingLevel, &'text str)> + '_ {
+        HeadingLevel::ALL
+            .iter()
+            .filter_map(move |&l| self.levels[l.depth() - 1].map(|t| (l, t)))
+    }
+
+    fn set(&mut self, level: HeadingLevel, text: &'text str) {
+        let idx = level.depth() - 1;
+        self.levels[idx] = Some(text);
+        // Clear deeper levels — a new H2 invalidates the previous H3/H4/…
+        for deeper in &mut self.levels[(idx + 1)..] {
+            *deeper = None;
+        }
+    }
+}
+
+/// A chunk plus its byte/char offsets *and* the heading hierarchy active at
+/// its byte offset. Returned by
+/// [`MarkdownSplitter::chunk_char_indices_with_context`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkCharIndexWithContext<'text> {
+    /// The text of the generated chunk.
+    pub chunk: &'text str,
+    /// The byte offset of the chunk within the original text.
+    pub byte_offset: usize,
+    /// The character offset of the chunk within the original text.
+    pub char_offset: usize,
+    /// Heading hierarchy active at this chunk's byte offset.
+    pub context: HeadingContext<'text>,
+}
+
+/// `(start_byte, level, text_slice)` per heading.
+type HeadingRecord<'text> = (usize, HeadingLevel, &'text str);
+
+/// In-flight heading state during the parse walk:
+/// `(start_byte, level, Option<(inner_first_byte, inner_last_byte)>)`.
+type CurrentHeading = (usize, HeadingLevel, Option<(usize, usize)>);
+
+/// Walk the markdown source via pulldown-cmark **once**, producing both the
+/// element ranges needed to chunk and the heading metadata needed for context.
+///
+/// Element classification matches [`classify_event`] / [`Splitter::parse`];
+/// heading text is collected as a sub-slice of `text` spanning from the first
+/// Text/Code event inside the heading to the last (pulldown-cmark already
+/// excludes the `#` markers / setext underline). Headings nested inside block
+/// quotes, list items, or footnote definitions are skipped — they don't
+/// define document structure.
+fn parse_markdown(text: &str) -> (Vec<(Element, Range<usize>)>, Vec<HeadingRecord<'_>>) {
+    let mut elements: Vec<(Element, Range<usize>)> = Vec::new();
+    let mut headings: Vec<HeadingRecord<'_>> = Vec::new();
+    let mut container_depth: usize = 0;
+    let mut current_heading: Option<CurrentHeading> = None;
+
+    for (event, range) in Parser::new_ext(text, Options::all()).into_offset_iter() {
+        if let Some(el) = classify_event(&event) {
+            elements.push((el, range.clone()));
+        }
+        match &event {
+            Event::Start(Tag::BlockQuote(_) | Tag::Item | Tag::FootnoteDefinition(_)) => {
+                container_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::Item | TagEnd::FootnoteDefinition) => {
+                container_depth = container_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Heading { level, .. }) if container_depth == 0 => {
+                current_heading = Some((range.start, (*level).into(), None));
+            }
+            Event::End(TagEnd::Heading(_)) if current_heading.is_some() => {
+                if let Some((start, level, inner_range)) = current_heading.take() {
+                    let inner = match inner_range {
+                        Some((s, e)) => &text[s..e],
+                        None => "",
+                    };
+                    headings.push((start, level, inner));
+                }
+            }
+            Event::Text(_) | Event::Code(_) if current_heading.is_some() => {
+                if let Some((_, _, ref mut inner_range)) = current_heading {
+                    match inner_range {
+                        Some((_, end)) => *end = range.end,
+                        None => *inner_range = Some((range.start, range.end)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (elements, headings)
+}
+
+/// Advance `ctx` so it reflects every heading whose byte offset is `<=
+/// byte_offset`. Mutates `*idx` so subsequent calls resume where we left off.
+fn advance_context<'text>(
+    ctx: &mut HeadingContext<'text>,
+    headings: &[HeadingRecord<'text>],
+    idx: &mut usize,
+    byte_offset: usize,
+) {
+    while *idx < headings.len() && headings[*idx].0 <= byte_offset {
+        let (_, level, text) = headings[*idx];
+        ctx.set(level, text);
+        *idx += 1;
     }
 }
 
@@ -884,5 +1140,281 @@ mod tests {
                 .level_ranges_after_offset(0, Element::Block)
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // chunks_with_context / HeadingContext
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn context_empty_for_doc_without_headings() {
+        let splitter = MarkdownSplitter::new(64);
+        let chunks: Vec<_> = splitter
+            .chunks_with_context("hello world\n\nsecond paragraph")
+            .collect();
+        assert!(!chunks.is_empty());
+        for (_, ctx) in &chunks {
+            assert_eq!(ctx.deepest(), None);
+            assert!(ctx.iter().next().is_none());
+        }
+    }
+
+    #[test]
+    fn context_tracks_atx_heading_levels() {
+        // Small capacity forces text-splitter to emit one chunk per section,
+        // so each chunk's byte_offset advances the context through nested headings.
+        let splitter = MarkdownSplitter::new(20);
+        let md = "# Top\n\nintro\n\n## Sub\n\nbody\n\n### Deep\n\ndeepbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+
+        // The last chunk sits past all three headings.
+        let (_, last_ctx) = chunks.last().expect("at least one chunk");
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some("Top"));
+        assert_eq!(last_ctx.at(HeadingLevel::H2), Some("Sub"));
+        assert_eq!(last_ctx.at(HeadingLevel::H3), Some("Deep"));
+        assert_eq!(last_ctx.deepest(), Some((HeadingLevel::H3, "Deep")));
+    }
+
+    #[test]
+    fn context_clears_deeper_levels_on_sibling_heading() {
+        let splitter = MarkdownSplitter::new(20);
+        let md = "# Top\n\nintro\n\n## A\n\n### Deep\n\nfoo\n\n## B\n\nbar\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+
+        // Last chunk is under "## B"; H3 from the earlier "### Deep" must be cleared.
+        let (_, last_ctx) = chunks.last().expect("at least one chunk");
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some("Top"));
+        assert_eq!(last_ctx.at(HeadingLevel::H2), Some("B"));
+        assert_eq!(last_ctx.at(HeadingLevel::H3), None);
+    }
+
+    #[test]
+    fn context_recognises_setext_heading() {
+        let splitter = MarkdownSplitter::new(64);
+        let md = "Title\n=====\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let body_chunk = chunks
+            .iter()
+            .find(|(c, _)| c.contains("body"))
+            .expect("body chunk");
+        assert_eq!(body_chunk.1.at(HeadingLevel::H1), Some("Title"));
+    }
+
+    #[test]
+    fn context_ignores_hash_inside_code_block() {
+        let splitter = MarkdownSplitter::new(128);
+        let md = "# Real\n\n```bash\n# shell comment, not a heading\n```\n\nafter\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        for (_, ctx) in &chunks {
+            // The only heading we should ever see is "Real".
+            for (_, text) in ctx.iter() {
+                assert_eq!(text, "Real");
+            }
+        }
+    }
+
+    #[test]
+    fn context_strips_atx_trailing_hashes() {
+        let splitter = MarkdownSplitter::new(64);
+        let md = "## Hello ##\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let body_chunk = chunks
+            .iter()
+            .find(|(c, _)| c.contains("body"))
+            .expect("body chunk");
+        assert_eq!(body_chunk.1.at(HeadingLevel::H2), Some("Hello"));
+    }
+
+    #[test]
+    fn chunk_indices_with_context_returns_byte_offsets() {
+        let splitter = MarkdownSplitter::new(64);
+        let md = "# A\n\nfoo\n\n# B\n\nbar\n";
+        let collected: Vec<_> = splitter.chunk_indices_with_context(md).collect();
+        // Every entry has (byte_offset, chunk_text, context).
+        for (byte_offset, chunk, _) in &collected {
+            assert_eq!(&md[*byte_offset..*byte_offset + chunk.len()], *chunk);
+        }
+    }
+
+    #[test]
+    fn chunk_char_indices_with_context_returns_full_struct() {
+        let splitter = MarkdownSplitter::new(64);
+        let md = "# A\n\nfoo\n\n# B\n\nbar\n";
+        let collected: Vec<_> = splitter.chunk_char_indices_with_context(md).collect();
+        assert!(!collected.is_empty());
+        for c in &collected {
+            assert_eq!(&md[c.byte_offset..c.byte_offset + c.chunk.len()], c.chunk);
+            // char_offset never exceeds byte_offset (chars ≤ bytes in UTF-8).
+            assert!(c.char_offset <= c.byte_offset);
+        }
+    }
+
+    #[test]
+    fn context_iter_yields_h1_to_h6_order() {
+        // Sanity check that HeadingContext::iter walks shallowest → deepest.
+        let mut ctx = HeadingContext::default();
+        ctx.set(HeadingLevel::H3, "deep");
+        ctx.set(HeadingLevel::H1, "top");
+        // Setting H1 clears deeper levels per the docs.
+        let levels: Vec<_> = ctx.iter().collect();
+        assert_eq!(levels, vec![(HeadingLevel::H1, "top")]);
+    }
+
+    // ------------------------------------------------------------------
+    // Weird heading cases — pin behavior against pathological markdown.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn context_handles_skipped_heading_levels() {
+        // `# A` directly to `### C` with no `##` in between. H2 stays vacant.
+        let splitter = MarkdownSplitter::new(20);
+        let md = "# A\n\nintro\n\n### C\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let (_, last_ctx) = chunks.last().unwrap();
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some("A"));
+        assert_eq!(last_ctx.at(HeadingLevel::H2), None);
+        assert_eq!(last_ctx.at(HeadingLevel::H3), Some("C"));
+        assert_eq!(last_ctx.deepest(), Some((HeadingLevel::H3, "C")));
+    }
+
+    #[test]
+    fn context_handles_multiple_h1s() {
+        let splitter = MarkdownSplitter::new(15);
+        let md = "# First\n\nfoo\n\n# Second\n\nbar\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let (_, last_ctx) = chunks.last().unwrap();
+        // Second H1 replaces the first; deeper levels (none here) cleared.
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some("Second"));
+        assert_eq!(last_ctx.deepest(), Some((HeadingLevel::H1, "Second")));
+    }
+
+    #[test]
+    fn context_handles_empty_heading_text() {
+        // CommonMark: `#` alone is a level-1 heading with empty content.
+        let splitter = MarkdownSplitter::new(20);
+        let md = "#\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let (_, last_ctx) = chunks.last().unwrap();
+        // We still register the level, just with empty text.
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some(""));
+    }
+
+    #[test]
+    fn context_handles_inline_formatting_in_heading() {
+        // pulldown-cmark emits Text events for the words but skips the
+        // `**` / `*` markers. Our text slice spans from the first to last
+        // Text event, so any markers between events are kept; markers
+        // strictly outside the first/last event are dropped.
+        let splitter = MarkdownSplitter::new(30);
+        let md = "## **bold** middle *em*\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let (_, last_ctx) = chunks.last().unwrap();
+        let h2 = last_ctx.at(HeadingLevel::H2).unwrap();
+        // Both content words must appear; exact marker representation is
+        // implementation detail of pulldown-cmark.
+        assert!(h2.contains("bold"), "expected `bold` in {h2:?}");
+        assert!(h2.contains("middle"), "expected `middle` in {h2:?}");
+        assert!(h2.contains("em"), "expected `em` in {h2:?}");
+    }
+
+    #[test]
+    fn context_ignores_heading_inside_blockquote() {
+        // Capacity small enough to force the splitter past byte_offset = 10
+        // where pulldown-cmark *does* emit Tag::Heading for `> ## Quoted`.
+        // Without the container-depth filter, the chunk past the blockquote
+        // would see ctx[H2] == Some("Quoted").
+        let splitter = MarkdownSplitter::new(15);
+        let md = "# Real\n\n> ## Quoted\n>\n> body of quote\n\nafter\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        // No chunk should see "Quoted" as H2 — it lives inside a block quote.
+        for (_, ctx) in &chunks {
+            assert_ne!(
+                ctx.at(HeadingLevel::H2),
+                Some("Quoted"),
+                "blockquoted heading leaked into context"
+            );
+        }
+        // The legitimate H1 is still picked up by some chunk.
+        let any_with_real = chunks
+            .iter()
+            .any(|(_, c)| c.at(HeadingLevel::H1) == Some("Real"));
+        assert!(any_with_real);
+    }
+
+    #[test]
+    fn context_ignores_heading_inside_list_item() {
+        let splitter = MarkdownSplitter::new(15);
+        let md = "# Real\n\n- ## Listed\n  body\n\nafter\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        for (_, ctx) in &chunks {
+            assert_ne!(
+                ctx.at(HeadingLevel::H2),
+                Some("Listed"),
+                "list-item heading leaked into context"
+            );
+        }
+    }
+
+    #[test]
+    fn context_handles_setext_alongside_atx() {
+        // Setext H1 followed by ATX H2 should produce a normal H1 → H2 chain.
+        let splitter = MarkdownSplitter::new(25);
+        let md = "Title\n=====\n\nintro\n\n## Sub\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        let (_, last_ctx) = chunks.last().unwrap();
+        assert_eq!(last_ctx.at(HeadingLevel::H1), Some("Title"));
+        assert_eq!(last_ctx.at(HeadingLevel::H2), Some("Sub"));
+    }
+
+    #[test]
+    fn context_handles_html_pseudo_heading_as_non_heading() {
+        // `<h1>...</h1>` is HTML, not a markdown heading — pulldown emits
+        // Event::Html, not Tag::Heading, so we ignore it.
+        let splitter = MarkdownSplitter::new(64);
+        let md = "<h1>HTML pretender</h1>\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        for (_, ctx) in &chunks {
+            assert_eq!(
+                ctx.deepest(),
+                None,
+                "no markdown heading should be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn context_handles_more_than_six_hashes_as_paragraph() {
+        // 7 `#`s isn't a valid ATX heading; it's a paragraph.
+        let splitter = MarkdownSplitter::new(64);
+        let md = "####### not a heading\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        for (_, ctx) in &chunks {
+            assert_eq!(ctx.deepest(), None);
+        }
+    }
+
+    #[test]
+    fn context_handles_hash_without_space() {
+        // `#foo` (no space after #) is not a heading per CommonMark.
+        let splitter = MarkdownSplitter::new(64);
+        let md = "#foo\n\nbody\n";
+        let chunks: Vec<_> = splitter.chunks_with_context(md).collect();
+        for (_, ctx) in &chunks {
+            assert_eq!(ctx.deepest(), None);
+        }
+    }
+
+    #[test]
+    fn context_set_clears_deeper_levels() {
+        let mut ctx = HeadingContext::default();
+        ctx.set(HeadingLevel::H1, "A");
+        ctx.set(HeadingLevel::H2, "B");
+        ctx.set(HeadingLevel::H3, "C");
+        assert_eq!(ctx.deepest(), Some((HeadingLevel::H3, "C")));
+        // Setting a new H2 should clear H3.
+        ctx.set(HeadingLevel::H2, "B2");
+        assert_eq!(ctx.at(HeadingLevel::H2), Some("B2"));
+        assert_eq!(ctx.at(HeadingLevel::H3), None);
+        assert_eq!(ctx.deepest(), Some((HeadingLevel::H2, "B2")));
     }
 }

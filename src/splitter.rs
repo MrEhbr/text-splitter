@@ -17,7 +17,7 @@ mod text;
 #[cfg(feature = "code")]
 pub use code::{CodeSplitter, CodeSplitterError};
 #[cfg(feature = "markdown")]
-pub use markdown::MarkdownSplitter;
+pub use markdown::{ChunkCharIndexWithContext, HeadingContext, HeadingLevel, MarkdownSplitter};
 pub use text::TextSplitter;
 
 /// Shared interface for splitters that can generate chunks of text based on the
