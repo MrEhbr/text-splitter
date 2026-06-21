@@ -50,7 +50,12 @@ use text_splitter::{ChunkConfig, TextSplitter};
 // trait from the text_splitter crate.
 use tokenizers::Tokenizer;
 
-let tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
+let mut tokenizer = Tokenizer::from_pretrained("bert-base-cased", None).unwrap();
+// If your tokenizer has truncation enabled, disable it before passing it to
+// the splitter. Otherwise chunk sizes can be capped by the tokenizer's
+// truncation limit.
+tokenizer.with_truncation(None).unwrap();
+
 let max_tokens = 1000;
 let splitter = TextSplitter::new(ChunkConfig::new(max_tokens).with_sizer(tokenizer));
 
@@ -201,8 +206,8 @@ There are lots of methods of determining sentence breaks, all to varying degrees
 
 | Dependency Feature | Version Supported | Description                                                                                                                                                                    |
 | ------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `tiktoken-rs`      | `^0.11.0`         | Enables `(Text/Markdown)Splitter::new` to take `tiktoken_rs::CoreBPE` as an argument. This is useful for splitting text for `OpenAI` models.                                   |
-| `tokenizers`       | `^0.22.0`         | Enables `(Text/Markdown)Splitter::new` to take `tokenizers::Tokenizer` as an argument. This is useful for splitting text models that have a Hugging Face-compatible tokenizer. |
+| `tiktoken-rs`      | `^0.12.0`         | Enables `(Text/Markdown)Splitter::new` to take `tiktoken_rs::CoreBPE` as an argument. This is useful for splitting text for `OpenAI` models.                                   |
+| `tokenizers`       | `^0.23.0`         | Enables `(Text/Markdown)Splitter::new` to take `tokenizers::Tokenizer` as an argument. This is useful for splitting text models that have a Hugging Face-compatible tokenizer. |
 
 ## Inspiration
 

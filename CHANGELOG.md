@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.32.0
+
+### What's New
+
+- Improve performance for documents that have very distant semantic boundaries.
+
+#### Python
+
+- Build `abi3t` wheels for free-threaded Python.
+- Release the GIL while loading Rust-backed tokenizers and running Rust-only chunking calls for `TextSplitter`, `MarkdownSplitter`, and `CodeSplitter`. Callback-backed splitters continue to hold the GIL while calling into Python.
+
+## v0.31.0
+
+### Breaking Changes
+
+- Updated `tokenizers` to v0.23 and `tiktoken-rs` to v0.12. Some Hugging Face
+  tokenizers include truncation settings, and `tokenizers` v0.23 may return
+  the truncated size for those tokenizers instead of exposing overflow encodings.
+  Disable truncation with `tokenizer.with_truncation(None)` before constructing
+  a splitter if chunk sizes should reflect the full input text.
+
 ## v0.30.1
 
 #### Python
